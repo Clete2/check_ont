@@ -9,9 +9,11 @@ The script uses Bash and Python (to avoid jq requirement), which were both avail
 
 I run LibreNMS in Docker, so I copied this into the `monitoring-plugins` folder available to me, and then restarted the stack, and I was able to see `check_ont` on the Services page.
 
-Next, I added the `check_ont` check to my X-ONU-SFPP host, and now I have metrics.
+Next, I added the `check_ont` check to my X-ONU-SFPP host, using `-p` flag to set RX power to positive (LibreNMS doesn't like negative numbers), and now 
+I have metrics.
 
 # Example output
+
 ```
 OK: all metrics within limits | 'cpu1_tempC'=54.45;20:65;20:65;; 'cpu2_tempC'=53.07;20:65;20:65;; 'optic_tempC'=44.0;20:65;20:65;; 'module_voltage'=3.37;3.201:3.399;3.201:3.399;; 'tx_power_dBm'=5.03;4:9;4:9;; 'rx_power_dBm'=-22.15;-29:-8;-29:-8;; 'ploam_state'=51;51:51;51:51;;
 ```
