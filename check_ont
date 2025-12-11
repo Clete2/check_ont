@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_OK=0
+STATE_CRIT=2
+STATE_UNKNOWN=3
+
+host="${PON_METRICS_HOST:-192.168.11.1}"
+scheme="${PON_METRICS_SCHEME:-https}"
+port="${PON_METRICS_PORT:-}"
+path="${PON_METRICS_PATH:-/cgi-bin/luci/8311/metrics}"
+url="${PON_METRICS_URL:-}"
+timeout="${PON_METRICS_TIMEOUT:-4}"
+ignore_ssl="${IGNORE_SSL_VALIDATION:-true}"
+
+usage() {
+  cat <<'EOF'
+Usage: ${0##*/} -H host [options]
+       ${0##*/} -U full_url [options]
+
+Required:
+  -H host        Hostname or IP (ignored when -U is given)
+
+Options:
+  -P port        TCP port (default: scheme default)
+  -s scheme      http or https (default: https)
+  -u path        Resource path (default: /cgi-bin/luci/8311/metrics)
+  -U url         Full URL override (takes precedence over -H/-s/-P/-u)
+  -T timeout     Curl timeout in seconds (default: 4 or $PON_METRICS_TIMEOUT)
+  -k             Ignore TLS certificate validation
+  -h             Show this help and exit with UNKNOWN
+
+Environment overrides:
+  PON_METRICS_URL, PON_METRICS_HOST, PON_METRICS_SCHEME, PON_METRICS_PORT,
+  PON_METRICS_PATH, PON_METRICS_TIMEOUT, IGNORE_SSL_VALIDATION.
+EOF
+  exit "$STATE_UNKNOWN"
+}
+
+while getopts ":H:P:s:u:U:T:kh" opt; do
+  case "$opt" in
+    H) host="$OPTARG" ;;
+    P) port="$OPTARG" ;;
+    s) scheme="$OPTARG" ;;
+    u) path="$OPTARG" ;;
+    U) url="$OPTARG" ;;
+    T) timeout="$OPTARG" ;;
+    k) ignore_ssl=true ;;
+    h) usage ;;
+    \?) echo "UNKNOWN: invalid option -$OPTARG" >&2; usage ;;
+    :) echo "UNKNOWN: option -$OPTARG requires an argument" >&2; usage ;;
+  esac
+done
+shift "$((OPTIND - 1))"
+
+if [[ -z "$url" && $# -gt 0 ]]; then
+  url="$1"
+fi
+
+if [[ -z "$url" ]]; then
+  [[ -n "$host" ]] || { echo "UNKNOWN: host (-H) or URL (-U) required"; usage; }
+  [[ "$path" == /* ]] || path="/$path"
+  url="${scheme}://${host}"
+  [[ -n "$port" ]] && url+=":$port"
+  url+="$path"
+fi
+
+curl_opts=(--silent --show-error --max-time "$timeout")
+[[ "$ignore_ssl" =~ ^(1|true|yes)$ ]] && curl_opts+=(--insecure)
+
+json="$(curl "${curl_opts[@]}" "$url")" || {
+  echo "CRITICAL: failed to collect metrics"
+  exit "$STATE_CRIT"
+}
+
+py_get() {
+  local key="$1"
+  JSON_PAYLOAD="$json" python3 - "$key" <<'PY'
+import json, os, sys
+key = sys.argv[1]
+try:
+    data = json.loads(os.environ["JSON_PAYLOAD"])
+    val = data[key]
+except Exception:
+    print(f"CRITICAL: {key} missing")
+    sys.exit(3)
+if isinstance(val, bool):
+    print(int(val))
+else:
+    print(val)
+PY
+}
+
+crit_msgs=()
+perf=()
+
+check_range() {
+  local key="$1" val="$2" low="$3" high="$4" units="$5"
+  (( $(echo "$val < $low" | bc -l) || $(echo "$val > $high" | bc -l) )) &&
+    crit_msgs+=("$key $val$units outside $low-$high$units")
+  perf+=("$key=$val;$high;$high;$low;$high")
+}
+
+TEMP_LOW=20; TEMP_HIGH=65
+V_LOW=$(bc <<<"scale=3;3.3*0.97"); V_HIGH=$(bc <<<"scale=3;3.3*1.03")
+TX_LOW=4; TX_HIGH=9
+RX_LOW=-29; RX_HIGH=-8
+PLOAM_REQUIRED=51
+
+for tkey in cpu1_tempC cpu2_tempC optic_tempC; do
+  val="$(py_get "$tkey")"
+  check_range "$tkey" "$val" "$TEMP_LOW" "$TEMP_HIGH" "C"
+done
+
+check_range "module_voltage" "$(py_get module_voltage)" "$V_LOW" "$V_HIGH" "V"
+check_range "tx_power_dBm" "$(py_get tx_power_dBm)" "$TX_LOW" "$TX_HIGH" "dBm"
+check_range "rx_power_dBm" "$(py_get rx_power_dBm)" "$RX_LOW" "$RX_HIGH" "dBm"
+
+ploam="$(py_get ploam_state)"
+if [[ "$ploam" != "$PLOAM_REQUIRED" ]]; then
+  crit_msgs+=("ploam_state $ploam != $PLOAM_REQUIRED")
+else
+  perf+=("ploam_state=$ploam;;;;")
+fi
+
+if ((${#crit_msgs[@]})); then
+  echo "CRITICAL: ${crit_msgs[*]} | ${perf[*]}"
+  exit "$STATE_CRIT"
+fi
+
+echo "OK: all metrics within limits | ${perf[*]}"
+exit "$STATE_OK"
