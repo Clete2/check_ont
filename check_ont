@@ -13,7 +13,7 @@ path="${PON_METRICS_PATH:-/cgi-bin/luci/8311/metrics}"
 url="${PON_METRICS_URL:-}"
 timeout="${PON_METRICS_TIMEOUT:-4}"
 ignore_ssl="${IGNORE_SSL_VALIDATION:-true}"
-positive_only=false
+positive_only=true
 rx_warn_overridden=false
 rx_crit_overridden=false
 
@@ -43,7 +43,7 @@ Options:
   -U url         Full URL override (takes precedence over -H/-s/-P/-u)
   -T timeout     Curl timeout in seconds (default: 4 or $PON_METRICS_TIMEOUT)
   -k             Ignore TLS certificate validation
-  -p             Use positive-only rx_power_dBm (abs value, 8:29 default)
+  -r             Use real rx_power_dBm values (allow negatives; default is positive)
   -w metric=range  Warning threshold override (Nagios range syntax)
   -c metric=range  Critical threshold override (Nagios range syntax)
   -h             Show this help and exit with UNKNOWN
@@ -214,7 +214,7 @@ check_metric() {
 
 set_default_thresholds
 
-while getopts ":H:P:s:u:U:T:kw:c:hp" opt; do
+while getopts ":H:P:s:u:U:T:kw:c:hr" opt; do
   case "$opt" in
     H) host="$OPTARG" ;;
     P) port="$OPTARG" ;;
@@ -225,7 +225,7 @@ while getopts ":H:P:s:u:U:T:kw:c:hp" opt; do
     k) ignore_ssl=true ;;
     w) set_threshold "WARN" "$OPTARG" ;;
     c) set_threshold "CRIT" "$OPTARG" ;;
-    p) positive_only=true ;;
+    r) positive_only=false ;;
     h) usage ;;
     \?) echo "UNKNOWN: invalid option -$OPTARG" >&2; usage ;;
     :) echo "UNKNOWN: option -$OPTARG requires an argument" >&2; usage ;;
