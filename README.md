@@ -11,6 +11,10 @@ I run LibreNMS in Docker, so I copied this into the `monitoring-plugins` folder 
 
 Next, I added the `check_ont` check to my X-ONU-SFPP host, and now I have metrics.
 
+# Example output
+`OK: all metrics within limits | cpu1_tempC=54.45;65;65;20;65 cpu2_tempC=53.07;65;65;20;65 optic_tempC=44.0;65;65;20;65 
+module_voltage=3.37;3.399;3.399;3.201;3.399 tx_power_dBm=5.03;9;9;4;9 rx_power_dBm=-22.15;-8;-8;-29;-8 ploam_state=51;;;;`
+
 # Example metrics
 
 ![metrics](./docs/metrics.png)
