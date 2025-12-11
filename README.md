@@ -7,7 +7,8 @@ based on [pon.wiki](https://pon.wiki)'s documentation.
 # Installation
 The script uses Bash and Python (to avoid jq requirement), which were both available on my [LibreNMS](https://librenms.org) installation.
 
-I run LibreNMS in Docker, so I copied this into the `monitoring-plugins` folder available to me, and then restarted the stack, and I was able to see `check_ont` on the Services page.
+I run LibreNMS in Docker, so I copied this into the `monitoring-plugins` folder available to me, and then restarted the stack, and I was able to see `ont` on the Services page. Note that the file is named `check_ont` but LibreNMS 
+removes `check_` from the name in the service listing.
 
 Next, I added the `ont` check to my X-ONU-SFPP host.
 
