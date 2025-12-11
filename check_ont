@@ -2,6 +2,7 @@
 set -euo pipefail
 
 STATE_OK=0
+STATE_WARNING=1
 STATE_CRIT=2
 STATE_UNKNOWN=3
 
@@ -12,6 +13,17 @@ path="${PON_METRICS_PATH:-/cgi-bin/luci/8311/metrics}"
 url="${PON_METRICS_URL:-}"
 timeout="${PON_METRICS_TIMEOUT:-4}"
 ignore_ssl="${IGNORE_SSL_VALIDATION:-true}"
+
+ALL_METRICS=(
+  cpu1_tempC
+  cpu2_tempC
+  optic_tempC
+  module_voltage
+  tx_power_dBm
+  rx_power_dBm
+  ploam_state
+)
+TEMP_METRICS=(cpu1_tempC cpu2_tempC optic_tempC)
 
 usage() {
   cat <<'EOF'
@@ -28,16 +40,166 @@ Options:
   -U url         Full URL override (takes precedence over -H/-s/-P/-u)
   -T timeout     Curl timeout in seconds (default: 4 or $PON_METRICS_TIMEOUT)
   -k             Ignore TLS certificate validation
+  -w metric=range  Warning threshold override (Nagios range syntax)
+  -c metric=range  Critical threshold override (Nagios range syntax)
   -h             Show this help and exit with UNKNOWN
 
-Environment overrides:
-  PON_METRICS_URL, PON_METRICS_HOST, PON_METRICS_SCHEME, PON_METRICS_PORT,
-  PON_METRICS_PATH, PON_METRICS_TIMEOUT, IGNORE_SSL_VALIDATION.
+Metrics: cpu1_tempC, cpu2_tempC, optic_tempC, module_voltage,
+         tx_power_dBm, rx_power_dBm, ploam_state
 EOF
   exit "$STATE_UNKNOWN"
 }
 
-while getopts ":H:P:s:u:U:T:kh" opt; do
+is_valid_metric() {
+  local metric="$1"
+  for candidate in "${ALL_METRICS[@]}"; do
+    [[ "$metric" == "$candidate" ]] && return 0
+  done
+  return 1
+}
+
+set_default_thresholds() {
+  WARN_cpu1_tempC="20:65"
+  CRIT_cpu1_tempC="20:65"
+  WARN_cpu2_tempC="20:65"
+  CRIT_cpu2_tempC="20:65"
+  WARN_optic_tempC="20:65"
+  CRIT_optic_tempC="20:65"
+
+  WARN_module_voltage="3.201:3.399"
+  CRIT_module_voltage="3.201:3.399"
+
+  WARN_tx_power_dBm="4:9"
+  CRIT_tx_power_dBm="4:9"
+
+  WARN_rx_power_dBm="-29:-8"
+  CRIT_rx_power_dBm="-29:-8"
+
+  WARN_ploam_state="51:51"
+  CRIT_ploam_state="51:51"
+}
+
+set_threshold() {
+  local type="$1" spec="$2"
+  [[ "$spec" == *=* ]] || {
+    echo "UNKNOWN: threshold must be metric=range" >&2
+    exit "$STATE_UNKNOWN"
+  }
+  local metric="${spec%%=*}"
+  local range="${spec#*=}"
+  if ! is_valid_metric "$metric"; then
+    echo "UNKNOWN: invalid metric '$metric' for -${type:0:1}" >&2
+    exit "$STATE_UNKNOWN"
+  fi
+  [[ -n "$range" ]] || {
+    echo "UNKNOWN: empty range for $metric" >&2
+    exit "$STATE_UNKNOWN"
+  }
+  printf -v "${type}_${metric}" '%s' "$range"
+}
+
+range_alert() {
+  local value="$1" range="$2"
+  [[ -n "$range" ]] || return 1
+  python3 - "$value" "$range" <<'PY'
+import sys
+
+value = float(sys.argv[1])
+range_spec = sys.argv[2]
+original = range_spec
+
+invert = range_spec.startswith('@')
+if invert:
+    range_spec = range_spec[1:]
+
+if ':' in range_spec:
+    start_raw, end_raw = range_spec.split(':', 1)
+else:
+    start_raw, end_raw = '0', range_spec
+
+if not start_raw:
+    start_raw = '0'
+
+try:
+    start = float('-inf') if start_raw == '~' else float(start_raw)
+except ValueError as exc:  # noqa: PERF203 (single conversion)
+    print(f"UNKNOWN: invalid range '{original}': {exc}", file=sys.stderr)
+    sys.exit(3)
+
+if not end_raw:
+    end = float('inf')
+elif end_raw == '~':
+    end = float('-inf')
+else:
+    try:
+        end = float(end_raw)
+    except ValueError as exc:
+        print(f"UNKNOWN: invalid range '{original}': {exc}", file=sys.stderr)
+        sys.exit(3)
+
+inside = start <= value <= end
+alert = inside if invert else not inside
+sys.exit(0 if alert else 1)
+PY
+}
+
+py_get() {
+  local key="$1"
+  JSON_PAYLOAD="$json" python3 - "$key" <<'PY'
+import json
+import os
+import sys
+
+key = sys.argv[1]
+try:
+    data = json.loads(os.environ["JSON_PAYLOAD"])
+    val = data[key]
+except Exception:
+    print(f"CRITICAL: {key} missing")
+    sys.exit(3)
+if isinstance(val, bool):
+    print(int(val))
+else:
+    print(val)
+PY
+}
+
+metric_units() {
+  case "$1" in
+    cpu1_tempC|cpu2_tempC|optic_tempC)
+      printf 'C'
+      ;;
+    module_voltage)
+      printf 'V'
+      ;;
+    tx_power_dBm|rx_power_dBm)
+      printf 'dBm'
+      ;;
+    *)
+      printf ''
+      ;;
+  esac
+}
+
+check_metric() {
+  local metric="$1" units="$2" value="$3"
+  local warn_var="WARN_${metric}"
+  local crit_var="CRIT_${metric}"
+  local warn_range="${!warn_var-}"
+  local crit_range="${!crit_var-}"
+
+  if [[ -n "$crit_range" ]] && range_alert "$value" "$crit_range"; then
+    crit_msgs+=("$metric $value$units outside $crit_range")
+  elif [[ -n "$warn_range" ]] && range_alert "$value" "$warn_range"; then
+    warn_msgs+=("$metric $value$units outside $warn_range")
+  fi
+
+  perf+=("'$metric'=$value;$warn_range;$crit_range;;")
+}
+
+set_default_thresholds
+
+while getopts ":H:P:s:u:U:T:kw:c:h" opt; do
   case "$opt" in
     H) host="$OPTARG" ;;
     P) port="$OPTARG" ;;
@@ -46,6 +208,8 @@ while getopts ":H:P:s:u:U:T:kh" opt; do
     U) url="$OPTARG" ;;
     T) timeout="$OPTARG" ;;
     k) ignore_ssl=true ;;
+    w) set_threshold "WARN" "$OPTARG" ;;
+    c) set_threshold "CRIT" "$OPTARG" ;;
     h) usage ;;
     \?) echo "UNKNOWN: invalid option -$OPTARG" >&2; usage ;;
     :) echo "UNKNOWN: option -$OPTARG requires an argument" >&2; usage ;;
@@ -68,64 +232,40 @@ fi
 curl_opts=(--silent --show-error --max-time "$timeout")
 [[ "$ignore_ssl" =~ ^(1|true|yes)$ ]] && curl_opts+=(--insecure)
 
-json="$(curl "${curl_opts[@]}" "$url")" || {
-  echo "CRITICAL: failed to collect metrics"
+if ! json="$(curl "${curl_opts[@]}" "$url")"; then
+  echo "CRITICAL: failed to collect metrics from $url"
   exit "$STATE_CRIT"
-}
-
-py_get() {
-  local key="$1"
-  JSON_PAYLOAD="$json" python3 - "$key" <<'PY'
-import json, os, sys
-key = sys.argv[1]
-try:
-    data = json.loads(os.environ["JSON_PAYLOAD"])
-    val = data[key]
-except Exception:
-    print(f"CRITICAL: {key} missing")
-    sys.exit(3)
-if isinstance(val, bool):
-    print(int(val))
-else:
-    print(val)
-PY
-}
+fi
 
 crit_msgs=()
+warn_msgs=()
 perf=()
 
-check_range() {
-  local key="$1" val="$2" low="$3" high="$4" units="$5"
-  (( $(echo "$val < $low" | bc -l) || $(echo "$val > $high" | bc -l) )) &&
-    crit_msgs+=("$key $val$units outside $low-$high$units")
-  perf+=("$key=$val;$high;$high;$low;$high")
-}
-
-TEMP_LOW=20; TEMP_HIGH=65
-V_LOW=$(bc <<<"scale=3;3.3*0.97"); V_HIGH=$(bc <<<"scale=3;3.3*1.03")
-TX_LOW=4; TX_HIGH=9
-RX_LOW=-29; RX_HIGH=-8
-PLOAM_REQUIRED=51
-
-for tkey in cpu1_tempC cpu2_tempC optic_tempC; do
-  val="$(py_get "$tkey")"
-  check_range "$tkey" "$val" "$TEMP_LOW" "$TEMP_HIGH" "C"
+for metric in "${TEMP_METRICS[@]}"; do
+  value="$(py_get "$metric")"
+  check_metric "$metric" "$(metric_units "$metric")" "$value"
 done
 
-check_range "module_voltage" "$(py_get module_voltage)" "$V_LOW" "$V_HIGH" "V"
-check_range "tx_power_dBm" "$(py_get tx_power_dBm)" "$TX_LOW" "$TX_HIGH" "dBm"
-check_range "rx_power_dBm" "$(py_get rx_power_dBm)" "$RX_LOW" "$RX_HIGH" "dBm"
+value="$(py_get module_voltage)"
+check_metric "module_voltage" "$(metric_units module_voltage)" "$value"
+
+value="$(py_get tx_power_dBm)"
+check_metric "tx_power_dBm" "$(metric_units tx_power_dBm)" "$value"
+
+value="$(py_get rx_power_dBm)"
+check_metric "rx_power_dBm" "$(metric_units rx_power_dBm)" "$value"
 
 ploam="$(py_get ploam_state)"
-if [[ "$ploam" != "$PLOAM_REQUIRED" ]]; then
-  crit_msgs+=("ploam_state $ploam != $PLOAM_REQUIRED")
-else
-  perf+=("ploam_state=$ploam;;;;")
-fi
+check_metric "ploam_state" "" "$ploam"
 
 if ((${#crit_msgs[@]})); then
   echo "CRITICAL: ${crit_msgs[*]} | ${perf[*]}"
   exit "$STATE_CRIT"
+fi
+
+if ((${#warn_msgs[@]})); then
+  echo "WARNING: ${warn_msgs[*]} | ${perf[*]}"
+  exit "$STATE_WARNING"
 fi
 
 echo "OK: all metrics within limits | ${perf[*]}"
